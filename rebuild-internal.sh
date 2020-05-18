@@ -4,20 +4,70 @@
 #
 # Rebuilds Crosvm and its dependencies from a clean state.
 
-SOURCE_DIR="$(pwd)/source"
-TOOLS_DIR="$(pwd)/tools"
-WORKING_DIR="$(pwd)/working"
+: ${TOOLS_DIR:="$(pwd)/tools"}
 
-ARCH="$(uname -m)"
-OUTPUT_DIR="$(pwd)/${ARCH}-linux-gnu"
-OUTPUT_BIN_DIR="${OUTPUT_DIR}/bin"
-OUTPUT_LIB_DIR="${OUTPUT_DIR}/bin"
+setup_env() {
+  : ${SOURCE_DIR:="$(pwd)/source"}
+  : ${WORKING_DIR:="$(pwd)/working"}
+  : ${CUSTOM_MANIFEST:=""}
 
-export PATH="${PATH}:${TOOLS_DIR}:${HOME}/.local/bin"
-CUSTOM_MANIFEST=""
+  ARCH="$(uname -m)"
+  : ${OUTPUT_DIR:="$(pwd)/${ARCH}-linux-gnu"}
+  OUTPUT_BIN_DIR="${OUTPUT_DIR}/bin"
+  OUTPUT_ETC_DIR="${OUTPUT_DIR}/etc"
+  OUTPUT_SECCOMP_DIR="${OUTPUT_ETC_DIR}/seccomp"
+  OUTPUT_LIB_DIR="${OUTPUT_DIR}/bin"
+
+  export PATH="${PATH}:${TOOLS_DIR}:${HOME}/.local/bin"
+}
 
 set -o errexit
 set -x
+
+fatal_echo() {
+  echo "$@"
+  exit 1
+}
+
+prepare_cargo() {
+  echo Setting up cargo...
+  cd
+  rm -rf .cargo
+  # Sometimes curl hangs. When it does, retry
+  retry curl -LO \
+    "https://static.rust-lang.org/rustup/archive/1.14.0/$(uname -m)-unknown-linux-gnu/rustup-init"
+  # echo "0077ff9c19f722e2be202698c037413099e1188c0c233c12a2297bf18e9ff6e7 *rustup-init" | sha256sum -c -
+  chmod +x rustup-init
+  ./rustup-init -y --no-modify-path
+  source $HOME/.cargo/env
+  if [[ -n "$1" ]]; then
+    rustup target add "$1"
+  fi
+  rustup component add rustfmt-preview
+  rm rustup-init
+
+  if [[ -n "$1" ]]; then
+  cat >>~/.cargo/config <<EOF
+[target.$1]
+linker = "${1/-unknown-/-}"
+EOF
+  fi
+}
+
+install_custom_scripts() {
+  # install our custom utility script used by $0 to ${TOOLS_DIR}
+  echo "Installing custom scripts..."
+  SCRIPTS_TO_INSTALL=("/static/policy-inliner.sh")
+  mkdir -p ${TOOLS_DIR} || /bin/true
+  for scr in ${SCRIPTS_TO_INSTALL[@]}; do
+    if ! [[ -f $scr ]]; then
+      >&2 echo "$scr must exist but does not"
+     exit 10
+    fi
+    chmod a+x $scr
+    cp -f $scr ${TOOLS_DIR}
+  done
+}
 
 install_packages() {
   echo Installing packages...
@@ -59,6 +109,21 @@ install_packages() {
   # Meson getting started guide mentions that the distro version is frequently
   # outdated and recommends installing via pip.
   pip3 install meson
+
+  # Tools for building gfxstream
+  pip3 install absl-py
+  pip3 install urlfetch
+
+  case "$(uname -m)" in
+    aarch64)
+      prepare_cargo
+      ;;
+    x86_64)
+      # Cross-compilation is x86_64 specific
+      sudo apt install -y crossbuild-essential-arm64
+      prepare_cargo aarch64-unknown-linux-gnu
+      ;;
+  esac
 }
 
 retry() {
@@ -67,31 +132,6 @@ retry() {
     sleep 1
   done
   return 1
-}
-
-prepare_cargo() {
-  echo Setting up cargo...
-  cd
-  rm -rf .cargo
-  # Sometimes curl hangs. When it does, retry
-  retry curl -LO \
-    "https://static.rust-lang.org/rustup/archive/1.14.0/$(uname -m)-unknown-linux-gnu/rustup-init"
-  # echo "0077ff9c19f722e2be202698c037413099e1188c0c233c12a2297bf18e9ff6e7 *rustup-init" | sha256sum -c -
-  chmod +x rustup-init
-  ./rustup-init -y --no-modify-path
-  source $HOME/.cargo/env
-  if [[ -n "$1" ]]; then
-    rustup target add "$1"
-  fi
-  rustup component add rustfmt-preview
-  rm rustup-init
-
-  if [[ -n "$1" ]]; then
-  cat >>~/.cargo/config <<EOF
-[target.$1]
-linker = "${1/-unknown-/-}"
-EOF
-  fi
 }
 
 fetch_source() {
@@ -106,11 +146,16 @@ fetch_source() {
     git config --global color.ui false
   fi
 
-  repo init -q -b crosvm-master -u https://android.googlesource.com/platform/manifest
-  if [[ -n "${CUSTOM_MANIFEST}" ]]; then
-    cp "${CUSTOM_MANIFEST}" .repo/manifests
-    repo init -m "${CUSTOM_MANIFEST}"
+  if [[ -z "${CUSTOM_MANIFEST}" ]]; then
+    # Building Crosvm currently depends using Chromium's directory scheme for subproject
+    # directories ('third_party' vs 'external').
+    fatal_echo "CUSTOM_MANIFEST must be provided. You most likely want to provide a full path to" \
+               "a copy of device/google/cuttlefish_vmm/${ARCH}-linux-gnu/manifest.xml."
   fi
+
+  repo init -q -u https://android.googlesource.com/platform/manifest
+  cp "${CUSTOM_MANIFEST}" .repo/manifests
+  repo init -m "${CUSTOM_MANIFEST}"
   repo sync
 }
 
@@ -124,14 +169,15 @@ prepare_source() {
 
 resync_source() {
   echo "Deleting source directory..."
-  rm -rf "${SOURCE_DIR}"
+  rm -rf "${SOURCE_DIR}/.*"
+  rm -rf "${SOURCE_DIR}/*"
   fetch_source
 }
 
 compile_minijail() {
   echo "Compiling Minijail..."
 
-  cd "${SOURCE_DIR}/third_party/minijail"
+  cd "${SOURCE_DIR}/external/minijail"
 
   make -j OUT="${WORKING_DIR}"
 
@@ -218,14 +264,38 @@ compile_virglrenderer() {
   ln -s -f "libvirglrenderer.so.1" "libvirglrenderer.so"
 }
 
+compile_gfxstream() {
+  echo "Compiling gfxstream..."
+
+    # Note: depends on libepoxy
+  cd "${SOURCE_DIR}/external/qemu"
+
+  # TODO: Fix or remove network unit tests that are failing in docker,
+  # so we can take out "notests"
+  python3 android/build/python/cmake.py --gfxstream_only --notests
+  local dist_dir="${SOURCE_DIR}/external/qemu/objs/distribution/emulator/lib64"
+
+  cp "${dist_dir}/libc++.so.1" "${OUTPUT_LIB_DIR}"
+  cp "${dist_dir}/libandroid-emu-shared.so" "${OUTPUT_LIB_DIR}"
+  cp "${dist_dir}/libemugl_common.so" "${OUTPUT_LIB_DIR}"
+  cp "${dist_dir}/libOpenglRender.so" "${OUTPUT_LIB_DIR}"
+  cp "${dist_dir}/libgfxstream_backend.so" "${OUTPUT_LIB_DIR}"
+}
+
 compile_crosvm() {
   echo "Compiling Crosvm..."
 
   source "${HOME}/.cargo/env"
   cd "${SOURCE_DIR}/platform/crosvm"
 
+  local crosvm_features=gpu,composite-disk
+
+  if [[ $BUILD_GFXSTREAM -eq 1 ]]; then
+      crosvm_features+=,gfxstream
+  fi
+
   RUSTFLAGS="-C link-arg=-Wl,-rpath,\$ORIGIN -C link-arg=-L${OUTPUT_LIB_DIR}" \
-    cargo build --features gpu,composite-disk
+    cargo build --features ${crosvm_features}
 
   # Save the outputs
   cp Cargo.lock "${OUTPUT_DIR}"
@@ -235,12 +305,38 @@ compile_crosvm() {
   rustup show > "${OUTPUT_DIR}/rustup_show.txt"
 }
 
+compile_crosvm_seccomp() {
+  # note that this depends on compile_crosvm
+  #
+  # for aarch64, this function should do nothing
+  # as the aarch64 subdirectory does not exist yet
+  #
+  echo "Processing Crosvm Seccomp..."
+
+  cd "${SOURCE_DIR}/platform/crosvm"
+  case ${ARCH} in
+    x86_64) subdir="${ARCH}" ;;
+    amd64) subdir="x86_64" ;;
+    arm64) subdir="aarch64" ;;
+    aarch64) subdir="${ARCH}" ;;
+    *)
+      echo "${ARCH} is not supported"
+      exit 15
+  esac
+  policy-inliner.sh \
+    -p $(pwd)/seccomp/$subdir \
+    -o ${OUTPUT_SECCOMP_DIR} \
+    -c $(pwd)/seccomp/$subdir/common_device.policy
+}
+
 compile() {
   echo "Compiling..."
   mkdir -p \
     "${WORKING_DIR}" \
     "${OUTPUT_DIR}" \
     "${OUTPUT_BIN_DIR}" \
+    "${OUTPUT_ETC_DIR}" \
+    "${OUTPUT_SECCOMP_DIR}" \
     "${OUTPUT_LIB_DIR}"
 
   compile_minijail
@@ -251,38 +347,41 @@ compile() {
 
   compile_virglrenderer
 
+  # TODO: Finish the aarch64 cross/native gfxstream build
+  if [[ $BUILD_GFXSTREAM -eq 1 ]]; then
+      compile_gfxstream
+  fi
+
   compile_crosvm
+
+  compile_crosvm_seccomp
 
   dpkg-query -W > "${OUTPUT_DIR}/builder-packages.txt"
   repo manifest -r -o "${OUTPUT_DIR}/manifest.xml"
   echo "Results in ${OUTPUT_DIR}"
 }
 
-arm64_retry() {
+aarch64_retry() {
   MINIGBM_DRV="RADEON VC4" compile
 }
 
-arm64_build() {
-  rm -rf "${WORKING_DIR}"
-  prepare_cargo
-  arm64_retry
+aarch64_build() {
+  rm -rf "${WORKING_DIR}/*"
+  aarch64_retry
 }
 
 x86_64_retry() {
-  MINIGBM_DRV="I915 RADEON VC4" compile
+  MINIGBM_DRV="I915 RADEON VC4" BUILD_GFXSTREAM=1 compile
 }
 
 x86_64_build() {
-  rm -rf "${WORKING_DIR}"
-  # Cross-compilation is x86_64 specific
-  sudo apt install -y crossbuild-essential-arm64
-  prepare_cargo aarch64-unknown-linux-gnu
+  rm -rf "${WORKING_DIR}/*"
   x86_64_retry
 }
 
 if [[ $# -lt 1 ]]; then
   echo Choosing default config
-  set prepare_source x86_64_build
+  set setup_env prepare_source x86_64_build
 fi
 
 echo Steps: "$@"
@@ -292,15 +391,18 @@ for i in "$@"; do
   case "$i" in
     ARCH=*) ARCH="${i/ARCH=/}" ;;
     CUSTOM_MANIFEST=*) CUSTOM_MANIFEST="${i/CUSTOM_MANIFEST=/}" ;;
-    arm64_build) $i ;;
-    arm64_retry) $i ;;
+    aarch64_build) $i ;;
+    aarch64_retry) $i ;;
+    setup_env) $i ;;
+    install_custom_scripts) $i ;;
     install_packages) $i ;;
+    fetch_source) $i ;;
     resync_source) $i ;;
     prepare_source) $i ;;
     x86_64_build) $i ;;
     x86_64_retry) $i ;;
     *) echo $i unknown 1>&2
-      echo usage: $0 'arm64_build|arm64_retry|prepare_source|x86_64_build|x86_64_retry ...' 1>&2
+      echo usage: $0 'install_packages|prepare_source|resync_source|fetch_source|$(uname -m)_build|$(uname -m)_retry' 1>&2
        exit 2
        ;;
   esac
